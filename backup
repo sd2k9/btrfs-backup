@@ -1,220 +1,175 @@
 #!/bin/bash
 
 # BASICS -----------------------------------------------------------------------
-
-# extended globbing is needed for argument parsing and source/filter expressions
+# extended globbing is needed for arg parsing and source/filter expressions
 shopt -s extglob
 
 # disable file globbing so things like * can be used for regexps
 set -f
 
-export script_name="$0"
-export script_dir="$(dirname $(readlink -f "$0"))"
-
-# Need to run btrfs subvolume as root with the help of sudo
-# Skip sudo when the script is run as root, because this usually is not allowed
-if [[ $EUID -eq 0 ]]; then
-    export sudo=''
-else
-    export sudo='sudo'
-fi
+# basic info set at init(), not considered configuration
+export script_name script_dir script_title script_version sudo
 
 
-# CONFIG DECLARATION AND DEFAULTS ----------------------------------------------
+# CONFIGURATION ----------------------------------------------------------------
+# these are "basic configuration", needed to load external config files
+# tune them at init()
+export -a config_locations=() config_suffixes=()
 
-# Defaults set here can be overridden at the config files passed with -c
+# defaults below can be overridden by external config and (in some cases) by
+# command line options
+
+# config file to use: full/relative path or just the name, in the latter case
+# the file will be searched for as specified in the config_* arrays above
+# command line override: -c
+export config=''
 
 # path to a btrfs subvolume (NOT a root volume), for snapshot storage
-# you should let this script create it
+# will be created automatically if it doesn't exist
 export destination=''
 
-# file globs with paths to back up
+# (single line) file globs with paths to back up
 export -a sources=()
 
-# per-source file globs with mandatory include / exclude paths
+# (multiline) rsync include / exclude patterns, indexed by entry in $sources
 export -A filters=()
 
-# min snapshots to keep per level (>= 0)
+# retention policy: min snapshots to keep per level (>= 0) before rotation
 export -A retention=( [leafs]=15 [days]=30 [weeks]=24 [months]=12 [years]=5 )
 
-# what to do when a snapshot is marked for rotation by the policy checks
-# so far the only handlers implemented are "test" and "remove"
-export rotate_action='remove'
+# what to do when a snapshot is marked for rotation by the retention checks
+# so far only "test" and "remove" are implemented
+export rotate_handler=remove
 
 # used in the weekly retention checks
 # 1=mon, 7=sun
 export weekstart=7
 
-# can be set by passing -d on the command line, or hardcoded to ex. 'echo'
+# prefix for commands in dryrun mode
+# command line override: -d (sets to 'msg')
 export dryrun=''
 
-# name of a configuration file stored in the same directory as this script
-# can be set by passing -c <name.conf>, or hardcoded here
-export config=''
-
-# recommended rsync flags, tune as needed
+# recommended rsync flags, tune as needed (-q sets $rsyncflags_verbose to '')
 export rsyncflags='-aHAXER --numeric-ids --inplace --no-whole-file --delete-delay --force'
 
-export rsyncflags_verbose="-hvv --progress"
+# flags for verbose mode in commands
+# command line override: -q (unsets)
+export flags_verbose='-v'
+export rsyncflags_verbose='-hvv --progress'
 
-# USER COMMANDS ----------------------------------------------------------------
-_help() {
-    msg<<EOF
-Usage: $script_name -h | help
-       $script_name [ACTION|OPTION]...
+# character used for header lines
+export header_char='~'
 
-  -h, help                  show this help
 
-Actions can be specified multiple times:
-  snap                      take a snapshot
-  rotate                    apply retention policy on old snapshots
-  test <n>                  test retention policy, simulating n random snapshots
-  find <regex>              find snapshots whose path matches the regular expression
-  remove <regex>            remove snapshots whose path matches the regular expression
+# I/O --------------------------------------------------------------------------
+msg() {
+    (( $# )) && {
+        echo -e "$@" >&2
+        return
+    }
 
-Options can be specified multiple times, only the last one is taken into account:
-  -c file                   configuration file to use, must exist in the same directory as this script
-  -d                        dry-run mode - only show what commands would be issued
-  -q                        be less verbose
-
-EOF
-    exit 0
+    cat >&2
 }
 
-_snap() {
-    header "Taking snapshot"
-    local base serial="$(date +%Y/%m/%d/%H%M%S)"
+error() {
+    msg "$@"
+    exit 1
+}
 
-    if [[ ! -d "$destination" ]]; then
-        # if this is the first snapshot we need to create the base subvolume
-        $dryrun btrfs subvolume create "$destination"
-        base="$destination"
+header() {
+    local tmp="${@}" length=80
+    local header=$(printf "%0$(( length - ${#tmp} ))d")
+    msg "\n$@ ${header//?/${header_char}}\n"
+}
+
+confirm() {
+    local expect="$1"
+    shift
+    msg $@
+    read
+    [[ "$REPLY" =~ $expect ]]
+}
+
+cond() {
+    local expr="$1" txt="$2"
+    shift 2
+
+    if { expr "$expr" > /dev/null ;}; then
+        echo -ne "$txt"
     else
-        # otherwise the base is the last snapshot under the base subvolume
-        base="$destination/$($sudo btrfs subvolume list -os --sort=ogen "$destination" | sed -nr '$s|^.*/([^/]+/[^/]+/[^/]+/[^/]+)$|\1|p')"
+        echo -ne "$@"
     fi
-
-    # create subtree for the new snapshot (yy/mm/dd branches)
-    $dryrun mkdir -vp "$destination/${serial%/*}"
-
-    # add leaf (hhmmss) as a snapshot, based on $base
-    $dryrun btrfs subvolume snapshot "$base" "$destination/$serial"
-
-    # remove from the first snapshot the copy of the initial subtree at the base
-    [[ "$base" == "$destination" ]] && $dryrun rm -rfv "$destination/$serial/${serial%/*}"
-
-    # update the new snapshot
-    local -a rsyncfilters=()
-    for source in "${sources[@]}"; do
-        msg "\nBacking up $source ..."
-        readarray -t rsyncfilters < <(sed '/^$/d' <<< "${filters["$source"]}")
-        $dryrun rsync $rsyncflags $rsyncflags_verbose "${rsyncfilters[@]/#/--filter=}" "$source" "$destination/$serial/"
-    done
 }
 
-_find() {
-    header "Finding snapshots"
-    local regex="$1" str=''
-    local -a found
 
-    [[ -d "$destination" ]] || error "Destination directory does not exists: \"$destination\""
-    cd "$destination"
-    readarray -t found < <(find . -maxdepth 4 -mindepth 4 -type d | sed -r "s|^\.(.*)|$destination\1|" | sort -dr | grep "$regex")
+# SNAPSHOT HELPERS -------------------------------------------------------------
 
-    (( ${#found[@]} != 1 )) && str='s'
-    msg "${#found[@]} snapshot$str found\n"
-
-    # stdout
-    (( ${#found[@]} )) && printf "%q\n" ${found[@]}
-}
-
-_remove() {
-    header "Removing snapshots"
-    _find "$@" | tokenize_path | rotate_remove --force
-}
-
-_rotate() {
-    header "Applying retention policy"
-    _find ".*" | tokenize_path | check_retention | rotate_${rotate_action}
-}
-
-_test() {
-    header "Testing retention policy"
-    local count=${1:-0} y=0 mo=0 d=0 h=0 mi=0
-
-    # FIXME: improve year generation
-    while (( count-- )); do
-        (( (y==0 || RANDOM % 100 + 1 > 50) && (y = RANDOM % 20 + 2000) ))
-        (( (mo==0 || RANDOM % 100 + 1 > 50) && (mo = RANDOM % 12 + 1) ))
-        (( (d==0 || RANDOM % 100 + 1 > 0) && (d = RANDOM % 27 + 1) ))
-        (( h = RANDOM % 23 + 1, mi = RANDOM % 59 + 1 ))
-        printf "$destination/%02d/%02d/%02d/%02d%02d\n" $y $mo $d $h $mi
-    done | sort -dr | tokenize_path | check_retention --all | rotate_test
-}
-
-# INTERNAL FUNCTIONS -----------------------------------------------------------
+# filter '/' in yyyy/mm/dd/hhmmmss lines to ' ', --tag n appends tag at EOL
+# tag must be an integer, it will likely be used in the future to encode
+# rotation level / misc info using bit maps
 tokenize_path() {
-    local mark=$(expr "$1" == "--mark")
-    (( mark )) && sed -re "s|^$destination/(.*)$|\1 $2|" -e 's|/| |g' \
-               || sed -re "s|^$destination/(.*)$|\1|" -e 's|/| |g'
+    local tag=$(( $(expr "$1" == '--tag') ? ${2:-1} : 0 ))
+    (( tag )) && sed -re "s|^$destination/(.*)$|\1 $tag|" -e 's|/| |g' \
+              || sed -re "s|^$destination/(.*)$|\1|" -e 's|/| |g'
 }
 
+# filter tokenize_path-style input, tagging lines along per $retention policy
+# with --all it outputs everything, instead of only tagged lines
 check_retention() {
-    local all=$(expr "$1" == "--all") rest y m d s cd=0 lw=0 cm=0 cy=0 rotate=0
+    local rest y m d hms cd=0 lw='' cm=0 cy=0 tag=0 all=$(expr "$1" == '--all')
 
     msg "Policy: keep the last ${retention[leafs]} leafs, ${retention[days]} days, ${retention[weeks]} weeks, ${retention[months]} months and ${retention[years]} years\n"
 
-    while read y m d s; do
-        # check retention over leaf snapshot counter (always changes)
-        (( rotate = retention[leafs]-- < 1 ))
+    while read y m d hms tag; do
+        # check retention over the leaf counter (always changes)
+        (( tag = retention[leafs]-- < 1 ))
 
         # check retention when the day has changed
-        (( 10#$cd != 10#$d && (cd = 10#$d, rotate &= retention[days]-- < 1) ))
+        (( 10#$cd != 10#$d && (cd = 10#$d, tag &= retention[days]-- < 1) ))
 
-        # if we are more than 6 days before the previous last day of week,
-        # check week retention as this is a different week
-        [[ "$lw" == "0" ]] || (( $(date -d "$lw UTC" +%s) - $(date -d "$y/$m/$d UTC" +%s) / (60 * 60 * 24) > 6 )) \
-        && (( rotate &= retention[weeks]-- < 1 ))
+        # if we are more than 6 days before the previous last day of week, then
+        # check the week retention, as this is a different week
+        [[ -n "$lw" ]] && (( $(date -d "$lw UTC" +%s) - $(date -d "$y/$m/$d UTC" +%s) / (60 * 60 * 24) > 6 )) \
+        && (( tag &= retention[weeks]-- < 1 ))
 
-        # get last day for the week of the snapshot
-        lw=$(date -d "$y/$m/$d -$(date -d $y/$m/$d +%u) days +$weekstart day" +"%F")
+        # get last day of week for this snapshot's date, check at next iteration
+        lw=$(date -d "$y/$m/$d -$(date -d $y/$m/$d +%u) days +$weekstart day" +'%F')
 
         # check month and year retention when they change
-        (( 10#$cm != 10#$m && (cm = 10#$m, rotate &= retention[months]-- < 1) ))
-        (( 10#$cy != 10#$y && (cy = 10#$y, rotate &= retention[years]-- < 1) ))
+        (( 10#$cm != 10#$m && (cm = 10#$m, tag &= retention[months]-- < 1) ))
+        (( 10#$cy != 10#$y && (cy = 10#$y, tag &= retention[years]-- < 1) ))
 
-        (( rotate || all )) && echo $y $m $d $s $rotate
+        (( tag || all )) && echo $y $m $d $hms $tag
     done
 }
 
-# rotation handlers ------------------------------------------------------------
+
+# ROTATION HANDLERS ------------------------------------------------------------
 rotate_test() {
-    local y m d s rotate rotated=0 str=''
-    while read y m d s rotate; do
-        (( rotate && ++rotated )) && str='' || str=' not'
-        msg "$destination/$y/$m/$d/$s$str marked"
+    local y m d hms tag tagged=0
+    while read y m d hms tag; do
+        (( tag && ++tagged ))
+        msg "$destination/$y/$m/$d/$hms$(cond $tag '' ' not') tagged"
     done
 
-    (( rotated != 1 )) && str='s'
-    msg "$rotated snapshot$str marked for rotation"
+    msg "$tagged snapshot$(cond "$tagged != 1" s) tagged for rotation"
 }
 
 rotate_remove() {
-    local force=$(expr "$1" == "--force") y m d s rotate removed=0 str=''
-    while read y m d s rotate; do
-        (( (force || rotate) && ++removed )) && {
-            $dryrun btrfs subvolume delete "$destination/$y/$m/$d/$s"
+    local y m d hms tag tagged=0
+    while read y m d hms tag; do
+        (( tag && ++tagged )) && {
+            $dryrun $sudo btrfs subvolume delete "$destination/$y/$m/$d/$hms"
 
             # clean empty subtree
             # FIXME: output will be inaccurate in dry mode as we can't remove parents
             for dir in "$destination/"{$y/$m/$d,$y/$m,$y}; do
-                [[ -z "$(ls -A "$dir")" ]] && $dryrun rmdir -v "$dir"
+                [[ -z "$(ls -A "$dir")" ]] && $dryrun rmdir $flags_verbose "$dir"
             done
         }
     done
 
-    (( removed != 1 )) && str='s'
-    msg "$removed snapshot$str removed"
+    msg "$tagged snapshot$(cond "$tagged != 1" s) removed"
 }
 
 rotate_archive() {
@@ -229,32 +184,202 @@ rotate_btrfs_send() {
     msg "$FUNCNAME: not implemented yet"
 }
 
-# general internal functions ---------------------------------------------------
-header() {
-    local limit=80 a=${@}
-    msg "$@ $(eval printf '=%.0s' {1..$(( $limit - ${#a} ))})\n"
+
+# USER COMMANDS ----------------------------------------------------------------
+cmd_help() {
+    msg <<EOF
+Usage: $script_name -h | help
+       $script_name [COMMAND|OPTION]...
+
+  -h, help                  show this help
+
+Commands can be specified multiple times:
+  snap                      take a snapshot
+  rotate                    apply retention policy on old snapshots
+  test <n>                  test retention policy, simulating n random snapshots
+  find <regex>              find snapshots whose path matches the regular expression
+  remove <regex>            remove snapshots whose path matches the regular expression
+
+Options can be specified multiple times, only the last one is taken into account:
+  -c file                   configuration file to use, must exist in the same directory as this script
+  -d                        dry-run mode - only show what commands would be issued
+  -q                        be less verbose
+  -y                        automatically accept confirmations (be careful!)
+
+EOF
+    exit 0
 }
 
-error() {
-    msg "$@"
-    exit 1
-}
+cmd_snap() {
+    header 'Taking snapshot'
 
-msg() {
-    (( $# )) && {
-        echo -e "$@" >&2
-        return
+    local serial="$(date +%Y/%m/%d/%H%M%S)" base="$destination$($sudo btrfs subvolume list -o --sort=ogen "$destination" 2>/dev/null | sed -nr '$s@.*/(([^/]+(/|$)){4})@/\1@p')"
+
+    [[ "$base" == "$destination/$serial" ]] && error "Refusing to create a new snapshot with serial $serial"
+
+    # create the destination btrfs subvolume if it doesn't exist
+    [[ ! -d "$destination" ]] && {
+        $dryrun btrfs subvolume create "$base"
+
+        # if running under sudo, ensure the underlying user has access to it
+        [[ -n "$SUDO_USER" ]] && (( ! $EUID )) && $dryrun $sudo chown $flags_verbose "$SUDO_USER":"$group" "$destination"
     }
 
-    local msg
-    while read msg; do
-        echo -e "$msg"
-    done >&2
+    # create yy/mm/dd subtree for the new hhmmss leaf
+    $dryrun mkdir $flags_verbose -p "$destination/${serial%/*}"
+
+    if [[ "$base" == "$destination" ]]; then
+        # first snapshot: the leaf is a standard subvolume
+        $dryrun btrfs subvolume create "$destination/$serial"
+    else
+        # otherwise it is a new snapshot based on the last one
+        $dryrun btrfs subvolume snapshot "$base" "$destination/$serial"
+    fi
+
+    # if running under sudo, ensure the underlying user has access to the leaf
+    [[ -n "$SUDO_USER" ]] && (( ! $EUID )) && {
+        local y m d hms group="$(getent group $SUDO_GID | cut -d: -f1)"
+
+        IFS='/' read y m d hms <<< "$serial"
+        for dir in "$destination/"{$serial,$y/$m/$d,$y/$m,$y}; do
+            $dryrun $sudo chown $flags_verbose "$SUDO_USER":"$group" "$dir"
+        done
+    }
+
+    # update the new snapshot
+    local -a rsyncfilters=()
+    for source in "${sources[@]}"; do
+        msg "\nBacking up $source ..."
+        readarray -t rsyncfilters< <(sed '/^$/d' <<< "${filters["$source"]}")
+        $dryrun rsync $rsyncflags $rsyncflags_verbose --filter="-/s $destination" "${rsyncfilters[@]/#/--filter=}" "$source" "$destination/$serial/"
+    done
 }
 
-go() {
+cmd_find() {
+    if [[ "$1" == '--no-header' ]]; then shift
+    else header 'Finding snapshots'
+    fi
+
+    local regex="$@"
+    local -a found
+
+    [[ -d "$destination" ]] || error "Destination directory does not exist: \"$destination\""
+    cd "$destination"
+
+    readarray -t found< <(find . -maxdepth 4 -mindepth 4 -type d | sed -r "s|^\.(.*)|$destination\1|" | sort -dr | grep "$regex")
+
+    msg <<< "${#found[@]} snapshot$(cond "${#found[@]} != 1" s) found"
+
+    # stdout
+    for line in ${!found[@]}; do
+        echo "${found[$line]}"
+    done
+}
+
+cmd_rotate() {
+    header "Applying retention policy (\"$rotate_handler\" rotation handler)"
+
+    cmd_find --no-header '.*' | tokenize_path | check_retention | rotate_${rotate_handler}
+}
+
+cmd_remove() {
+    header 'Removing snapshots'
+
+    local snaps
+    readarray -t snaps< <(cmd_find --no-header "$@")
+
+    (( ${#snaps[@]} )) && {
+        (( assume_yes )) || {
+            printf '%s\n' "${snaps[@]}"
+
+            confirm 'yes|y' "\nRemove $(cond "${#snaps[@]} > 1" them it)? Enter \"y\" or \"yes\" to confirm: " || unset snaps
+            msg ''
+        }
+    }
+
+    printf '%s\n' "${snaps[@]}" | tokenize_path --tag | rotate_remove
+}
+
+cmd_test() {
+    header 'Testing retention policy'
+
+    local -A results
+    local count=${1:-0} new leapfeb yr=1.3 y m d h mi
+    local daysmonth=( 31 28 31 30 31 30 31 31 30 31 30 31 )
+
+    # year range: ensure retention years are > 0 and factor by $yr
+    yr=$(LC_NUMERIC="en_US.UTF-8" printf "%.0f" $(bc <<< "(${retention[years]} + 1) * $yr"))
+
+    while (( count )); do
+        (( y = RANDOM % (yr + 1) + $(date +%Y) - yr, m = RANDOM % 12 + 1 ))
+        (( leapfeb = ! (y % 4 || ! y % 100 && y % 400) && m == 2 ))
+        (( d = RANDOM % (daysmonth[m - 1] + leapfeb) + 1 ))
+        (( h = RANDOM % 23 + 1, mi = RANDOM % 59 + 1 ))
+
+        new="$(printf "%02d/%02d/%02d/%02d%02d" $y $m $d $h $mi)"
+        [[ -z "${results[$new]:-}" ]] && {
+            results[$new]=''
+            echo "$destination/$new"
+            (( count-- ))
+        }
+    done | sort -dr | tokenize_path | check_retention --all | rotate_test
+}
+
+
+# MAIN -------------------------------------------------------------------------
+init() {
+    for section in "$@"; do
+        case $section in
+            basics)
+                # basic information about the script
+                script_name="$0"
+                script_dir="$(dirname $(readlink -f "$0"))"
+                script_title="btrfs-backup"
+                [[ -f "$script_dir/VERSION" ]] && {
+                    read script_version < "$script_dir/VERSION"
+                }
+
+                # some btrfs subcommands need to be run as root via sudo
+                # skip when we already are root, as then it might not be allowed
+                sudo=$(cond $EUID sudo '')
+
+                # locations where to search for config files
+                config_locations+=("$script_dir")
+                config_locations+=("$script_dir/config")
+                config_locations+=('.')
+
+                # file suffixes to use when searching
+                config_suffixes+=('')
+                config_suffixes+=(.conf)
+                config_suffixes+=(.cf)
+
+                ;;
+        esac
+    done
+}
+
+get_config() {
+    local file="$@"
+
+    # naked name: search files ending in $config_suffixes at $config_locations
+    [[ ! "$@" =~ ^[./].* ]] && {
+        for location in "${config_locations[@]}"; do
+            for suffix in "${config_suffixes[@]}"; do
+                file="$location/${@}${suffix}"
+                [[ -f "$file" ]] && break 2
+            done
+        done
+    }
+
+    [[ ! -f "$file" ]] && error "Configuration file not found: \"$@\""
+
+    echo "$file"
+}
+
+cmdline() {
     local token numtokens=$# skip_else
-    local -a actions=() action_args=()
+    local -a commands=()
+    local -A command_args=()
 
     while token="$1"; do
         shift
@@ -262,14 +387,14 @@ go() {
         skip_else=0
         case "$token" in
             snap|find|remove|rotate|test)
-                actions+=("_$token")
+                commands+=("$token")
                 skip_else=1
                 ;;&
 
             find|remove|test)
-                (( $# )) || error "Expected an argument for the \"$token\" action"
-                [[ "$token" == "test" && -n "${1//[0-9]/}" ]] &&  error "Argument for action \"$token\" must be numeric"
-                action_args[$((${#actions[@]} - 1 ))]="$1"
+                (( $# )) || error "Expected an argument for the \"$token\" command"
+                [[ "$token" == "test" && -n "${1//[0-9]/}" ]] &&  error "Argument for command \"$token\" must be numeric"
+                command_args[$(( ${#commands[@]} - 1 ))]="$1"
                 shift
                 ;;
 
@@ -279,18 +404,22 @@ Extra tokens on command line: ${@//${token}/}
 "$token" must be passed alone, ie: $script_name $token
 
 EOF
-                _help
+                cmd_help
                 ;;
 
-            -c) (( $# )) || error "Expected a config file name after -c"
-                config="$script_dir/$1"
+            -c) (( $# )) || error 'Expected a config file name after -c'
+                export config="$1"
                 shift
                 ;;
 
             -d) dryrun='msg'
                 ;;
 
-            -q) rsyncflags_verbose=''
+            -q) export rsyncflags_verbose=''
+                export flags_verbose=''
+                ;;
+
+            -y) assume_yes=1
                 ;;
 
             -*) error "Invalid option: $token"
@@ -304,15 +433,24 @@ EOF
         esac
     done
 
-    (( ${#actions[@]} )) || error "Please specify an action, or -h for help"
+    (( ${#commands[@]} )) || error 'Please specify a command, or -h for help'
 
-    [[ -f "$config" ]] && . "$config" || error "Configuration file not found: \"$config\""
+    [[ -n "$config" ]] && {
+        config="$(get_config "$config")" || exit $?
 
-    [[ -n "$dryrun" ]] && msg "DRY-RUN MODE - this is a simulation\n"
+        msg "Using configuration file: $config"
+        . "$config"
+    }
 
-    for action in ${!actions[@]}; do
-        ${actions[$action]} ${action_args[$action]}
+    init basics
+
+    [[ -n "$dryrun" ]] && msg 'DRY-RUN MODE - this is a simulation\n'
+
+    for cmd in ${!commands[@]}; do
+        cmd_${commands[$cmd]} ${command_args[$cmd]}
     done
 }
 
-go $@
+init basics
+msg "$script_title $script_version\n"
+cmdline $@
