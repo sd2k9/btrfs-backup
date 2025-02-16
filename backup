@@ -380,7 +380,9 @@ init() {
                 config_locations=()
                 config_locations+=("$script_dir")
                 config_locations+=("$script_dir/config")
-                config_locations+=('.')
+                # sd2k9: Search for configuration files in /etc location instead of local directory
+                # config_locations+=('.')
+                config_locations+=('/etc/btrfs-backup')
 
                 # file suffixes to use when searching
                 config_suffixes=()

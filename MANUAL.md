@@ -42,7 +42,7 @@ It defaults to these locations:
 
 * The directory where the script is stored
 * A `/config` subdirectory at the above location
-* `'.'` the current directory
+* The `/etc/btrfs-backup` directory
 
 
 `config_suffixes`
