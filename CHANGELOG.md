@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file. See [standard-version](https://github.com/conventional-changelog/standard-version) for commit guidelines.
 
+### [1.5.1](https://github.com/3coma3/btrfs-backup/compare/v1.5.0...v1.5.1) (2021-07-06)
+
+
+### Bug Fixes
+
+* bug in week retention checks ([06caa4f](https://github.com/3coma3/btrfs-backup/commit/06caa4fb7ca6c1628dfc8e18c28cc5254877adc8)), closes [#25](https://github.com/3coma3/btrfs-backup/issues/25)
+* bugs in cmd_test() ([c3f6db0](https://github.com/3coma3/btrfs-backup/commit/c3f6db0ce8aed9fd32a44fabf2597d8ee83c6d9f)), closes [#1](https://github.com/3coma3/btrfs-backup/issues/1) [#2](https://github.com/3coma3/btrfs-backup/issues/2)
+
+
+### Improvements
+
+* remove second init basics call ([45a0c16](https://github.com/3coma3/btrfs-backup/commit/45a0c1662029d618e2989ba7b9dac49d905f6fb7))
+* use readonly for init basics ([161a13e](https://github.com/3coma3/btrfs-backup/commit/161a13eb7170eb81f9dcea1470af8235cc85ded3))
+
+## [1.5.0](https://github.com/3coma3/btrfs-backup/compare/v1.4.3...v1.5.0) (2021-06-28)
+
+
+### Features
+
+* choose progress meter configuration ([e3d5a37](https://github.com/3coma3/btrfs-backup/commit/e3d5a3792a26ddb70d593881e033b46112f14d28))
+* configuration helper commands ([32075b0](https://github.com/3coma3/btrfs-backup/commit/32075b0af56ac190ecb0b7bffdef7e69209d80f8))
+
+
+### Bug Fixes
+
+* force naked file names to omit path ([0824731](https://github.com/3coma3/btrfs-backup/commit/0824731c2214265d2bd7475dfa5bf11e64988248))
+* quotes in command line arguments ([d933c2e](https://github.com/3coma3/btrfs-backup/commit/d933c2ed7a8a496823b37f9ad6d45d068fdd3ef5))
+* reset init arrays ([2c70992](https://github.com/3coma3/btrfs-backup/commit/2c70992d46cffc3c6530a1bb9507ccea864406ae))
+
+
+### Improvements
+
+* add long options ([1ff248c](https://github.com/3coma3/btrfs-backup/commit/1ff248c1e5cb8500f34fc7e5a0dd9412b1062a8d))
+
 ### [1.4.3](https://github.com/3coma3/btrfs-backup/compare/v1.4.2...v1.4.3) (2021-05-30)
 
 

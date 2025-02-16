@@ -25,12 +25,15 @@ So I wrote this little piece and I've been pretty happy with the results:
 ## Features
 
 * Plain bash. No DSL, no complex parameters, no nothing
-* ~300 lines of code omitting config, comments and blank lines
+* ~350 lines of code omitting config, comments and blank lines
 * No impositions. It may be used as needed, manually or via cron. It does its job and gets out of the way.
 * Does Incremental, in place, COW powered snapshots out of any file system Rsync can read, courtesy of Btrfs
 * Custom GFS-style rotation algorithm to maintain arbitrary copies at the snapshot, day, week, month and year levels
 * Compact data source specification in extended bash "glob" [pattern syntax](https://mywiki.wooledge.org/glob)
-* Compact per-data-source filter specification in rsync's own [pattern syntax](https://manpages.ubuntu.com/manpages/eoan/en/man1/rsync.1.html#include/exclude%20pattern%20rules)
+* Compact per-data-source filter specification in rsync's own [pattern syntax](https://man7.org/linux/man-pages/man1/rsync.1.html#INCLUDE/EXCLUDE_PATTERN_RULES)
 * Queued operations
 * Dry-run mode
 * Global defaults / config file / command line option overrides
+* Configuration file helpers (showcfg/editcfg/dumpcfg)
+* Selectable options for rsync progress report
+* Pipeable standard output: non-essential messages are directed to standard error
